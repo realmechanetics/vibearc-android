@@ -24,6 +24,9 @@ public class MainActivity extends AppCompatActivity {
     private WebView webView;
     private PermissionRequest currentPermissionRequest;
 
+    private android.webkit.ValueCallback<Uri[]> uploadMessage;
+
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -73,6 +76,22 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
                 request.grant(request.getResources());
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView webView, android.webkit.ValueCallback<Uri[]> filePathCallback, WebChromeClient.FileChooserParams fileChooserParams) {
+
+                // Save the callback bridge instantly so onActivityResult can access it!
+                uploadMessage = filePathCallback;
+
+                // Tells the native container to handle the document storage window intents safely
+                Intent intent = fileChooserParams.createIntent();
+                try {
+                    startActivityForResult(intent, 102);
+                } catch (Exception e) {
+                    return false;
+                }
+                return true;
             }
         });
 
@@ -130,4 +149,38 @@ public class MainActivity extends AppCompatActivity {
             }
         }
     }
+
+    // THE FILES BRIDGE: Receives the selected songs from Android storage and hands them to React
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        // Match the 102 request code we set inside our file chooser client loop
+        if (requestCode == 102) {
+            if (uploadMessage == null) return;
+
+            Uri[] result = null;
+            if (resultCode == RESULT_OK && data != null) {
+                if (data.getClipData() != null) {
+                    // Handles multiple audio files selected at once
+                    int count = data.getClipData().getItemCount();
+                    result = new Uri[count];
+                    for (int i = 0; i < count; i++) {
+                        result[i] = data.getClipData().getItemAt(i).getUri();
+                    }
+                } else if (data.getData() != null) {
+                    // Handles a single audio file selection
+                    result = new Uri[]{data.getData()};
+                }
+            }
+
+            // Hand the file tokens directly to Chrome's WebView receiver loop
+            uploadMessage.onReceiveValue(result);
+            uploadMessage = null;
+        }
+    }
+
+
+
+
 }
