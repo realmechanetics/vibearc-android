@@ -9,6 +9,7 @@ import android.os.Bundle;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -17,6 +18,14 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.URL;
+import java.net.URLConnection;
+
 
 public class MainActivity extends AppCompatActivity {
 
@@ -40,7 +49,7 @@ public class MainActivity extends AppCompatActivity {
         settings.setDatabaseEnabled(true);
 
         // VERCEL ACCENT BYPASS: Mimic an official mobile Google Chrome browser thread
-        String chromeAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
+        final String chromeAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
         settings.setUserAgentString(chromeAgent);
 
         // BREAK AUTOPLAY & SPEAKER SANITY BLOCKS: Unlock native text-to-speech speaker synthesis completely
@@ -50,6 +59,48 @@ public class MainActivity extends AppCompatActivity {
 
         // FIXED LOGIN LOOP: Intercept OAuth transitions and hand them to external Chrome browser
         webView.setWebViewClient(new WebViewClient() {
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                String url = request.getUrl().toString();
+
+                // Only snapshot core assets to avoid intercepting external audio streams
+                if (url.equals("https://vercel.app") || url.equals("https://vibearc-player.vercel.app/") || url.contains(".js") || url.contains(".css")) {
+                    try {
+                        String localFileName = url.replaceAll("[^a-zA-Z0-9]", "_") +
+                                (url.contains(".js") ? ".js" : url.contains(".css") ? ".css" : ".html");
+                        File localFile = new File(getFilesDir(), localFileName);
+
+                        // If online, silently write a permanent UI snapshot to internal device disk
+                        if (isNetworkAvailable()) {
+                            new Thread(() -> {
+                                try {
+                                    URLConnection connection = new URL(url).openConnection();
+                                    connection.setRequestProperty("User-Agent", chromeAgent);
+                                    InputStream in = connection.getInputStream();
+                                    FileOutputStream out = new FileOutputStream(localFile);
+                                    byte[] buffer = new byte[4096];
+                                    int read;
+                                    while ((read = in.read(buffer)) != -1) {
+                                        out.write(buffer, 0, read);
+                                    }
+                                    out.close();
+                                    in.close();
+                                } catch (Exception ignored) {}
+                            }).start();
+                        }
+
+                        // If offline, instantly load the user interface directly out of absolute memory!
+                        if (localFile.exists()) {
+                            String mimeType = url.contains(".js") ? "application/javascript" : url.contains(".css") ? "text/css" : "text/html";
+                            return new WebResourceResponse(mimeType, "UTF-8", new FileInputStream(localFile));
+                        }
+                    } catch (Exception ignored) {}
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+
+
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
@@ -180,6 +231,15 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private boolean isNetworkAvailable() {
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            android.net.NetworkInfo info = cm.getActiveNetworkInfo();
+            return info != null && info.isConnected();
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
 
 
