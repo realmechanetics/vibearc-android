@@ -3,19 +3,11 @@
     android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#000000"
-    android:clipChildren="true">
+    android:background="#000000">
 
     <android.webkit.WebView
         android:id="@+id/vibearc_webview"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
-
-    <FrameLayout
-        android:id="@+id/settings_ad_container"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
-        android:background="@android:color/transparent"
-        android:visibility="gone" />
 
 </FrameLayout>
