@@ -7,12 +7,21 @@ import android.content.BroadcastReceiver;
 import android.content.ContentUris;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
+import android.provider.Settings;
+import android.speech.RecognitionSupport;
+import android.speech.RecognitionSupportCallback;
 import android.speech.RecognitionListener;
+import android.speech.ModelDownloadListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.webkit.PermissionRequest;
@@ -23,9 +32,8 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
-import android.database.Cursor;
-import android.provider.MediaStore;
 import androidx.annotation.NonNull;
+import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -39,6 +47,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
+import java.util.List;
 import org.json.JSONObject;
 import org.json.JSONArray;
 
@@ -50,20 +59,26 @@ public class MainActivity extends AppCompatActivity {
     private static final int MICROPHONE_PERMISSION_REQUEST_CODE = 101;
     private static final int AUDIO_LIBRARY_PERMISSION_REQUEST_CODE = 103;
     private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 104;
+    private static final String SPEECH_PREFERENCES = "vibearc_speech";
+    private static final String SPEECH_LOCALE = "locale";
+    private static final String DEFAULT_SPEECH_LOCALE = "en-IN";
     private PermissionRequest currentPermissionRequest;
 
     private WebView webView;
     private android.webkit.ValueCallback<Uri[]> uploadMessage;
     private SpeechRecognizer speechRecognizer;
+    private SpeechRecognizer speechModelDownloader;
     private boolean pendingNativeVoiceRecognition;
     private boolean microphonePermissionPending;
     private boolean suppressSpeechCallbacks;
+    private boolean offlineRecognitionRequest;
     private boolean keepWebViewActiveForAudio;
     private boolean mediaControlReceiverRegistered;
     private String pendingNativePlaybackTrack;
     private boolean activityResumed;
     private boolean nativePlaybackServiceActive;
     private Boolean lastReportedActivityVisibility;
+    private volatile String activeSpeechLocale = DEFAULT_SPEECH_LOCALE;
 
     private final BroadcastReceiver mediaControlReceiver = new BroadcastReceiver() {
         @Override
@@ -102,6 +117,9 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         webView = findViewById(R.id.vibearc_webview);
+        activeSpeechLocale = getSharedPreferences(SPEECH_PREFERENCES, MODE_PRIVATE)
+                .getString(SPEECH_LOCALE, DEFAULT_SPEECH_LOCALE);
+        removeLegacyVoskModels();
         IntentFilter mediaFilter = new IntentFilter(MediaPlaybackService.ACTION_CONTROL);
         mediaFilter.addAction("com.mechanetics.vibearc.PLAYBACK_STATE");
         androidx.core.content.ContextCompat.registerReceiver(
@@ -248,6 +266,7 @@ public class MainActivity extends AppCompatActivity {
             speechRecognizer.destroy();
             speechRecognizer = null;
         }
+        releaseSpeechModelDownloader();
         if (mediaControlReceiverRegistered) {
             unregisterReceiver(mediaControlReceiver);
             mediaControlReceiverRegistered = false;
@@ -299,6 +318,48 @@ public class MainActivity extends AppCompatActivity {
         @android.webkit.JavascriptInterface
         public void stopVoiceRecognition() {
             runOnUiThread(() -> stopNativeVoiceRecognition(true));
+        }
+
+        @android.webkit.JavascriptInterface
+        public String getSpeechLocale() {
+            return activeSpeechLocale;
+        }
+
+        @android.webkit.JavascriptInterface
+        public boolean setSpeechLocale(String locale) {
+            if (!isSupportedSpeechLocale(locale)) return false;
+            activeSpeechLocale = locale;
+            getSharedPreferences(SPEECH_PREFERENCES, MODE_PRIVATE)
+                    .edit()
+                    .putString(SPEECH_LOCALE, locale)
+                    .apply();
+            return true;
+        }
+
+        @android.webkit.JavascriptInterface
+        public void checkOnDeviceSpeechModel(String locale) {
+            runOnUiThread(() -> checkOnDeviceSpeechModelOnMainThread(locale));
+        }
+
+        @android.webkit.JavascriptInterface
+        public void downloadOnDeviceSpeechModel(String locale) {
+            runOnUiThread(() -> requestOnDeviceSpeechModelDownload(locale));
+        }
+
+        @android.webkit.JavascriptInterface
+        public void openSpeechSettings() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS));
+                } catch (Exception exception) {
+                    Toast.makeText(MainActivity.this, "Open your Android speech input settings to manage voice services.", Toast.LENGTH_LONG).show();
+                }
+            });
+        }
+
+        @android.webkit.JavascriptInterface
+        public boolean isInternetAvailable() {
+            return MainActivity.this.isNetworkAvailable();
         }
 
         @android.webkit.JavascriptInterface
@@ -604,14 +665,35 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         pendingNativeVoiceRecognition = false;
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "unavailable");
+        offlineRecognitionRequest = !isNetworkAvailable();
+        boolean recognizerAvailable = offlineRecognitionRequest
+                ? Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                        && SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+                : SpeechRecognizer.isRecognitionAvailable(this);
+        if (!recognizerAvailable) {
+            dispatchAndroidSpeechEvent(
+                    "vibearc:android-speech-error",
+                    offlineRecognitionRequest ? "ondevice-unavailable" : "unavailable"
+            );
             return;
         }
 
-        if (speechRecognizer != null) speechRecognizer.destroy();
+        if (speechRecognizer != null) {
+            speechRecognizer.destroy();
+            speechRecognizer = null;
+        }
         suppressSpeechCallbacks = false;
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        try {
+            speechRecognizer = offlineRecognitionRequest
+                    ? SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+                    : SpeechRecognizer.createSpeechRecognizer(this);
+        } catch (RuntimeException exception) {
+            dispatchAndroidSpeechEvent(
+                    "vibearc:android-speech-error",
+                    offlineRecognitionRequest ? "ondevice-unavailable" : "unavailable"
+            );
+            return;
+        }
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
             @Override
             public void onReadyForSpeech(Bundle params) { }
@@ -635,7 +717,15 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onError(int error) {
                 if (!suppressSpeechCallbacks) {
-                    dispatchAndroidSpeechEvent("vibearc:android-speech-error", "recognition");
+                    String reason = "recognition";
+                    if (offlineRecognitionRequest
+                            && error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
+                        reason = "offline-model-required";
+                    } else if (offlineRecognitionRequest
+                            && error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED) {
+                        reason = "offline-language-unsupported";
+                    }
+                    dispatchAndroidSpeechEvent("vibearc:android-speech-error", reason);
                 }
             }
 
@@ -658,12 +748,224 @@ public class MainActivity extends AppCompatActivity {
 
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, activeSpeechLocale);
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
         try {
             speechRecognizer.startListening(intent);
         } catch (RuntimeException e) {
             dispatchAndroidSpeechEvent("vibearc:android-speech-error", "unavailable");
+        }
+    }
+
+    private boolean isSupportedSpeechLocale(String locale) {
+        return locale != null
+                && locale.length() <= 35
+                && locale.matches("(?i)[a-z]{2,3}(-[a-z0-9]{2,8})*");
+    }
+
+    private void removeLegacyVoskModels() {
+        File legacyModels = new File(getNoBackupFilesDir(), "offline-speech");
+        if (legacyModels.exists() && !deleteLegacySpeechFiles(legacyModels)) {
+            android.util.Log.e("VibeArc", "Could not remove the old bundled speech model files.");
+        }
+    }
+
+    private boolean deleteLegacySpeechFiles(File file) {
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children == null) return false;
+            for (File child : children) {
+                if (!deleteLegacySpeechFiles(child)) return false;
+            }
+        }
+        return file.delete();
+    }
+
+    private Intent buildSpeechRecognitionIntent(String locale) {
+        return new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale)
+                .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+    }
+
+    private void checkOnDeviceSpeechModelOnMainThread(String locale) {
+        if (!isSupportedSpeechLocale(locale)) {
+            dispatchSpeechModelState(locale, false, false, false, "unsupported-locale", null);
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                || !SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+            dispatchSpeechModelState(locale, false, false, false, "unavailable", null);
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            dispatchSpeechModelState(locale, true, false, false, "system-settings-required", null);
+            return;
+        }
+
+        SpeechRecognizer checker = SpeechRecognizer.createOnDeviceSpeechRecognizer(this);
+        try {
+            checker.checkRecognitionSupport(
+                    buildSpeechRecognitionIntent(locale),
+                    ContextCompat.getMainExecutor(this),
+                    new RecognitionSupportCallback() {
+                        @Override
+                        public void onSupportResult(RecognitionSupport support) {
+                            boolean supported = containsLocale(support.getSupportedOnDeviceLanguages(), locale)
+                                    || containsLocale(support.getInstalledOnDeviceLanguages(), locale);
+                            boolean installed = containsLocale(support.getInstalledOnDeviceLanguages(), locale);
+                            boolean pending = containsLocale(support.getPendingOnDeviceLanguages(), locale);
+                            dispatchSpeechModelState(
+                                    locale,
+                                    true,
+                                    supported,
+                                    installed,
+                                    installed ? "installed"
+                                            : pending ? "download-pending"
+                                            : supported ? "download-required" : "unsupported",
+                                    support
+                            );
+                            if (installed) releaseSpeechModelDownloader();
+                            checker.destroy();
+                        }
+
+                        @Override
+                        public void onError(int error) {
+                            android.util.Log.e("VibeArc", "Android speech support check failed: " + error);
+                            dispatchSpeechModelState(locale, true, false, false, "check-failed", null);
+                            checker.destroy();
+                        }
+                    }
+            );
+        } catch (RuntimeException exception) {
+            checker.destroy();
+            dispatchSpeechModelState(locale, true, false, false, "check-failed", null);
+        }
+    }
+
+    private boolean containsLocale(List<String> locales, String languageTag) {
+        if (locales == null) return false;
+        for (String availableLocale : locales) {
+            if (availableLocale.equalsIgnoreCase(languageTag)) return true;
+        }
+        return false;
+    }
+
+    private void dispatchSpeechModelState(
+            String locale,
+            boolean onDeviceAvailable,
+            boolean supported,
+            boolean installed,
+            String status,
+            RecognitionSupport support
+    ) {
+        JSONObject state = new JSONObject();
+        try {
+            state.put("locale", locale == null ? JSONObject.NULL : locale);
+            state.put("onDeviceAvailable", onDeviceAvailable);
+            state.put("supported", supported);
+            state.put("installed", installed);
+            state.put("status", status);
+            JSONArray installedLanguages = new JSONArray();
+            JSONArray supportedLanguages = new JSONArray();
+            if (support != null && support.getInstalledOnDeviceLanguages() != null) {
+                for (String installedLocale : support.getInstalledOnDeviceLanguages()) {
+                    installedLanguages.put(installedLocale);
+                }
+            }
+            if (support != null && support.getSupportedOnDeviceLanguages() != null) {
+                for (String supportedLocale : support.getSupportedOnDeviceLanguages()) {
+                    supportedLanguages.put(supportedLocale);
+                }
+            }
+            state.put("installedLanguages", installedLanguages);
+            state.put("supportedLanguages", supportedLanguages);
+        } catch (Exception exception) {
+            android.util.Log.e("VibeArc", "Could not serialize speech model status.", exception);
+        }
+        dispatchAndroidEvent("vibearc:android-speech-model-state", state.toString());
+    }
+
+    private void requestOnDeviceSpeechModelDownload(String locale) {
+        if (!isSupportedSpeechLocale(locale)) {
+            dispatchSpeechModelState(locale, false, false, false, "unsupported-locale", null);
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+                || !SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+            dispatchSpeechModelState(locale, false, false, false, "download-unavailable", null);
+            return;
+        }
+
+        releaseSpeechModelDownloader();
+        speechModelDownloader = SpeechRecognizer.createOnDeviceSpeechRecognizer(this);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                triggerSpeechModelDownloadWithProgress(locale);
+            } else {
+                speechModelDownloader.triggerModelDownload(buildSpeechRecognitionIntent(locale));
+                dispatchSpeechModelDownloadState(locale, "download-requested", -1);
+            }
+        } catch (RuntimeException exception) {
+            android.util.Log.e("VibeArc", "Could not request Android speech model download.", exception);
+            dispatchSpeechModelDownloadState(locale, "download-failed", -1);
+            releaseSpeechModelDownloader();
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    private void triggerSpeechModelDownloadWithProgress(String locale) {
+        speechModelDownloader.triggerModelDownload(
+                buildSpeechRecognitionIntent(locale),
+                ContextCompat.getMainExecutor(this),
+                new ModelDownloadListener() {
+                    @Override
+                    public void onProgress(int completedPercent) {
+                        dispatchSpeechModelDownloadState(locale, "download-progress", completedPercent);
+                    }
+
+                    @Override
+                    public void onScheduled() {
+                        dispatchSpeechModelDownloadState(locale, "download-pending", -1);
+                    }
+
+                    @Override
+                    public void onSuccess() {
+                        dispatchSpeechModelDownloadState(locale, "download-complete", 100);
+                        releaseSpeechModelDownloader();
+                        checkOnDeviceSpeechModelOnMainThread(locale);
+                    }
+
+                    @Override
+                    public void onError(int error) {
+                        android.util.Log.e("VibeArc", "Android speech model download failed: " + error);
+                        dispatchSpeechModelDownloadState(locale, "download-failed", -1);
+                        releaseSpeechModelDownloader();
+                    }
+                }
+        );
+        dispatchSpeechModelDownloadState(locale, "download-requested", -1);
+    }
+
+    private void dispatchSpeechModelDownloadState(String locale, String status, int progress) {
+        JSONObject state = new JSONObject();
+        try {
+            state.put("locale", locale);
+            state.put("onDeviceAvailable", true);
+            state.put("supported", true);
+            state.put("installed", false);
+            state.put("status", status);
+            if (progress >= 0) state.put("progress", progress);
+        } catch (Exception exception) {
+            android.util.Log.e("VibeArc", "Could not serialize speech download status.", exception);
+        }
+        dispatchAndroidEvent("vibearc:android-speech-model-state", state.toString());
+    }
+
+    private void releaseSpeechModelDownloader() {
+        if (speechModelDownloader != null) {
+            speechModelDownloader.destroy();
+            speechModelDownloader = null;
         }
     }
 
@@ -829,13 +1131,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private boolean isNetworkAvailable() {
-        try {
-            android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-            android.net.NetworkInfo info = cm.getActiveNetworkInfo();
-            return info != null && info.isConnected();
-        } catch (Exception e) {
-            return false;
-        }
+        ConnectivityManager connectivity = getSystemService(ConnectivityManager.class);
+        if (connectivity == null) return false;
+        Network activeNetwork = connectivity.getActiveNetwork();
+        NetworkCapabilities capabilities = connectivity.getNetworkCapabilities(activeNetwork);
+        return capabilities != null
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
     }
 
 
