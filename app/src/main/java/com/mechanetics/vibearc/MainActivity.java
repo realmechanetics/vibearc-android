@@ -797,26 +797,13 @@ public class MainActivity extends AppCompatActivity {
                 public void onPartialResult(String hypothesis) { }
 
                 @Override
-                public void onResult(String hypothesis) { }
+                public void onResult(String hypothesis) {
+                    finishOfflineVoiceRecognition(requestId, hypothesis);
+                }
 
                 @Override
                 public void onFinalResult(String hypothesis) {
-                    String transcript = "";
-                    try {
-                        transcript = new JSONObject(hypothesis).optString("text", "").trim();
-                    } catch (Exception ignored) {
-                        transcript = "";
-                    }
-                    String finalTranscript = transcript;
-                    runOnUiThread(() -> {
-                        if (requestId != speechRequestId || suppressSpeechCallbacks) return;
-                        stopNativeVoiceRecognition(false);
-                        if (finalTranscript.isEmpty()) {
-                            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "no-speech");
-                        } else {
-                            dispatchAndroidSpeechEvent("vibearc:android-speech-result", finalTranscript);
-                        }
-                    });
+                    finishOfflineVoiceRecognition(requestId, hypothesis);
                 }
 
                 @Override
@@ -830,17 +817,52 @@ public class MainActivity extends AppCompatActivity {
 
                 @Override
                 public void onTimeout() {
-                    runOnUiThread(() -> {
-                        if (requestId != speechRequestId || suppressSpeechCallbacks) return;
-                        stopNativeVoiceRecognition(false);
-                        dispatchAndroidSpeechEvent("vibearc:android-speech-ended", null);
-                    });
+                    String finalResult = "";
+                    try {
+                        if (voskRecognizer != null) {
+                            finalResult = voskRecognizer.getFinalResult();
+                        }
+                    } catch (RuntimeException ignored) {
+                        finalResult = "";
+                    }
+                    finishOfflineVoiceRecognition(requestId, finalResult);
                 }
-            });
+            }, 20000);
         } catch (Exception exception) {
             stopNativeVoiceRecognition(false);
             dispatchAndroidSpeechEvent("vibearc:android-speech-error", "offline-model-failed");
         }
+    }
+
+    private void finishOfflineVoiceRecognition(int requestId, String hypothesis) {
+        if (requestId != speechRequestId || suppressSpeechCallbacks) return;
+        String transcript = "";
+        try {
+            transcript = new JSONObject(hypothesis).optString("text", "").trim();
+        } catch (Exception ignored) {
+            transcript = "";
+        }
+
+        speechRequestId++;
+        suppressSpeechCallbacks = true;
+        SpeechService service = voskSpeechService;
+        Recognizer recognizer = voskRecognizer;
+        voskSpeechService = null;
+        voskRecognizer = null;
+
+        if (transcript.isEmpty()) {
+            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "no-speech");
+        } else {
+            dispatchAndroidSpeechEvent("vibearc:android-speech-result", transcript);
+        }
+
+        new Thread(() -> {
+            if (service != null) {
+                service.stop();
+                service.shutdown();
+            }
+            if (recognizer != null) recognizer.close();
+        }, "vibearc-speech-cleanup").start();
     }
 
     private void releaseVoskModel() {
