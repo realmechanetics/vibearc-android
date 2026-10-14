@@ -24,6 +24,8 @@ import android.speech.RecognitionListener;
 import android.speech.ModelDownloadListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.util.Log;
+import android.view.View;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -31,12 +33,24 @@ import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import android.view.Gravity;
+
+import com.google.android.gms.ads.AdListener;
+import com.google.android.gms.ads.AdRequest;
+import com.google.android.gms.ads.AdSize;
+import com.google.android.gms.ads.AdView;
+import com.google.android.gms.ads.LoadAdError;
+import com.google.android.gms.ads.MobileAds;
+import com.google.android.ump.ConsentInformation;
+import com.google.android.ump.ConsentRequestParameters;
+import com.google.android.ump.UserMessagingPlatform;
 
 import java.util.ArrayList;
 import java.io.File;
@@ -56,6 +70,7 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String APP_URL = "https://vibearc-player.vercel.app/";
     private static final String APP_ORIGIN = "https://vibearc-player.vercel.app";
+    private static final String ADS_LOG_TAG = "VibeArcAds";
     private static final int MICROPHONE_PERMISSION_REQUEST_CODE = 101;
     private static final int AUDIO_LIBRARY_PERMISSION_REQUEST_CODE = 103;
     private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 104;
@@ -65,6 +80,14 @@ public class MainActivity extends AppCompatActivity {
     private PermissionRequest currentPermissionRequest;
 
     private WebView webView;
+    private FrameLayout settingsAdContainer;
+    private AdView settingsAdView;
+    private volatile ConsentInformation consentInformation;
+    private boolean settingsAdsVisible;
+    private boolean settingsAdInViewport;
+    private boolean consentInfoResolved;
+    private boolean adSdkInitializationStarted;
+    private boolean adSdkInitialized;
     private android.webkit.ValueCallback<Uri[]> uploadMessage;
     private SpeechRecognizer speechRecognizer;
     private SpeechRecognizer speechModelDownloader;
@@ -117,6 +140,7 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         webView = findViewById(R.id.vibearc_webview);
+        settingsAdContainer = findViewById(R.id.settings_ad_container);
         activeSpeechLocale = getSharedPreferences(SPEECH_PREFERENCES, MODE_PRIVATE)
                 .getString(SPEECH_LOCALE, DEFAULT_SPEECH_LOCALE);
         removeLegacyVoskModels();
@@ -231,6 +255,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         webView.loadUrl(APP_URL);
+        requestAdConsentUpdate();
         handleOAuthReturnIntent(getIntent());
     }
 
@@ -238,6 +263,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         activityResumed = false;
         reportNativePlaybackActivityVisibility();
+        if (settingsAdView != null) settingsAdView.pause();
         if (!microphonePermissionPending) stopNativeVoiceRecognition(false);
         if (webView != null) {
             webView.evaluateJavascript(
@@ -256,6 +282,8 @@ public class MainActivity extends AppCompatActivity {
         if (webView != null) {
             webView.onResume();
         }
+        if (settingsAdView != null) settingsAdView.resume();
+        loadSettingsBannerIfEligible();
         reportNativePlaybackActivityVisibility();
     }
 
@@ -267,6 +295,8 @@ public class MainActivity extends AppCompatActivity {
             speechRecognizer = null;
         }
         releaseSpeechModelDownloader();
+        settingsAdsVisible = false;
+        destroySettingsAdView();
         if (mediaControlReceiverRegistered) {
             unregisterReceiver(mediaControlReceiver);
             mediaControlReceiverRegistered = false;
@@ -275,6 +305,52 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public class VibeArcJavascriptInterface {
+        @android.webkit.JavascriptInterface
+        public void setSettingsAdPosition(
+                double left,
+                double top,
+                double width,
+                double height,
+                boolean visible
+        ) {
+            runOnUiThread(() -> {
+                settingsAdsVisible = visible;
+                if (!visible) {
+                    destroySettingsAdView();
+                    return;
+                }
+                positionSettingsAd(left, top, width, height);
+                loadSettingsBannerIfEligible();
+            });
+        }
+
+        @android.webkit.JavascriptInterface
+        public boolean isAdPrivacyOptionsRequired() {
+            ConsentInformation info = consentInformation;
+            return info != null &&
+                    info.getPrivacyOptionsRequirementStatus() ==
+                            ConsentInformation.PrivacyOptionsRequirementStatus.REQUIRED;
+        }
+
+        @android.webkit.JavascriptInterface
+        public void showAdPrivacyOptionsForm() {
+            runOnUiThread(() -> {
+                ConsentInformation info = consentInformation;
+                if (info == null ||
+                        info.getPrivacyOptionsRequirementStatus() !=
+                                ConsentInformation.PrivacyOptionsRequirementStatus.REQUIRED) {
+                    return;
+                }
+                UserMessagingPlatform.showPrivacyOptionsForm(MainActivity.this, error -> {
+                    if (error != null) {
+                        Log.w(ADS_LOG_TAG, "Could not show the ad privacy options form: " +
+                                error.getMessage());
+                    }
+                    refreshAdConsentState();
+                });
+            });
+        }
+
         @android.webkit.JavascriptInterface
         public void launchSecureExternalLogin(String authUrl) {
             if (authUrl == null || authUrl.length() > 2048) {
@@ -996,6 +1072,161 @@ public class MainActivity extends AppCompatActivity {
         new Handler(Looper.getMainLooper()).post(() -> {
             if (webView != null) webView.evaluateJavascript(script, null);
         });
+    }
+
+    private void requestAdConsentUpdate() {
+        consentInformation = UserMessagingPlatform.getConsentInformation(this);
+        ConsentRequestParameters parameters = new ConsentRequestParameters.Builder().build();
+        consentInformation.requestConsentInfoUpdate(
+                this,
+                parameters,
+                () -> {
+                    consentInfoResolved = true;
+                    dispatchAdPrivacyOptionsState();
+                    UserMessagingPlatform.loadAndShowConsentFormIfRequired(
+                            this,
+                            error -> {
+                                if (error != null) {
+                                    Log.w(ADS_LOG_TAG, "Could not present the required consent form: " +
+                                            error.getMessage());
+                                }
+                                refreshAdConsentState();
+                            }
+                    );
+                },
+                error -> {
+                    consentInfoResolved = true;
+                    Log.w(ADS_LOG_TAG, "Could not update ad consent information: " +
+                            error.getMessage());
+                    refreshAdConsentState();
+                }
+        );
+    }
+
+    private void refreshAdConsentState() {
+        dispatchAdPrivacyOptionsState();
+        ConsentInformation info = consentInformation;
+        if (info == null || !info.canRequestAds()) {
+            destroySettingsAdView();
+            return;
+        }
+        loadSettingsBannerIfEligible();
+    }
+
+    private void dispatchAdPrivacyOptionsState() {
+        ConsentInformation info = consentInformation;
+        boolean privacyOptionsRequired = info != null &&
+                info.getPrivacyOptionsRequirementStatus() ==
+                        ConsentInformation.PrivacyOptionsRequirementStatus.REQUIRED;
+        boolean canRequestAds = info != null && info.canRequestAds();
+        dispatchAndroidEvent(
+                "vibearc:ad-consent-state",
+                "{\"privacyOptionsRequired\":" + privacyOptionsRequired +
+                        ",\"canRequestAds\":" + canRequestAds + "}"
+        );
+    }
+
+    private void loadSettingsBannerIfEligible() {
+        ConsentInformation info = consentInformation;
+        if (!settingsAdsVisible || !settingsAdInViewport || !activityResumed ||
+                !consentInfoResolved ||
+                info == null || !info.canRequestAds()) {
+            return;
+        }
+        if (!adSdkInitializationStarted) {
+            adSdkInitializationStarted = true;
+            new Thread(() -> MobileAds.initialize(
+                    getApplicationContext(),
+                    initializationStatus -> runOnUiThread(() -> {
+                        adSdkInitialized = true;
+                        loadSettingsBannerIfEligible();
+                    })
+            )).start();
+            return;
+        }
+        if (!adSdkInitialized || settingsAdView != null) return;
+
+        AdView adView = new AdView(this);
+        adView.setAdUnitId(getString(R.string.admob_settings_banner_id));
+        adView.setAdListener(new AdListener() {
+            @Override
+            public void onAdLoaded() {
+                if (settingsAdView == adView && settingsAdsVisible &&
+                        settingsAdInViewport && activityResumed) {
+                    settingsAdContainer.setVisibility(View.VISIBLE);
+                }
+            }
+
+            @Override
+            public void onAdFailedToLoad(LoadAdError error) {
+                Log.w(ADS_LOG_TAG, "Settings banner failed to load: " + error.getMessage());
+                if (settingsAdView == adView) {
+                    settingsAdContainer.setVisibility(View.GONE);
+                }
+            }
+        });
+        settingsAdView = adView;
+        float density = getResources().getDisplayMetrics().density;
+        int widthDp = Math.max(1, Math.round(settingsAdContainer.getLayoutParams().width / density));
+        adView.setAdSize(AdSize.getCurrentOrientationAnchoredAdaptiveBannerAdSize(
+                MainActivity.this,
+                widthDp
+        ));
+        settingsAdContainer.addView(
+                adView,
+                new FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        Gravity.CENTER
+                )
+        );
+        settingsAdContainer.setVisibility(settingsAdInViewport ? View.VISIBLE : View.INVISIBLE);
+        adView.loadAd(new AdRequest.Builder().build());
+    }
+
+    private void positionSettingsAd(
+            double left,
+            double top,
+            double width,
+            double height
+    ) {
+        if (settingsAdContainer == null || webView == null) return;
+        float density = getResources().getDisplayMetrics().density;
+        int[] rootLocation = new int[2];
+        int[] webViewLocation = new int[2];
+        settingsAdContainer.getRootView().getLocationOnScreen(rootLocation);
+        webView.getLocationOnScreen(webViewLocation);
+
+        int x = webViewLocation[0] - rootLocation[0] + Math.round((float) left * density);
+        int y = webViewLocation[1] - rootLocation[1] + Math.round((float) top * density);
+        int widthPixels = Math.round((float) width * density);
+        int heightPixels = Math.round((float) height * density);
+        if (widthPixels <= 0 || heightPixels <= 0) return;
+
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) settingsAdContainer.getLayoutParams();
+        params.width = widthPixels;
+        params.height = heightPixels;
+        params.leftMargin = x;
+        params.topMargin = y;
+        params.gravity = Gravity.TOP | Gravity.LEFT;
+        settingsAdContainer.setLayoutParams(params);
+
+        boolean changedViewportVisibility = !settingsAdInViewport;
+        settingsAdInViewport = true;
+        if (settingsAdView != null) {
+            settingsAdContainer.setVisibility(View.VISIBLE);
+            if (changedViewportVisibility && activityResumed) settingsAdView.resume();
+        }
+    }
+
+    private void destroySettingsAdView() {
+        settingsAdInViewport = false;
+        if (settingsAdView != null) {
+            settingsAdContainer.removeView(settingsAdView);
+            settingsAdView.destroy();
+            settingsAdView = null;
+        }
+        settingsAdContainer.setVisibility(View.GONE);
     }
 
     private void reportNativePlaybackActivityVisibility() {
