@@ -43,8 +43,6 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
 import java.util.List;
@@ -193,14 +191,6 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
-                String host = uri.getHost();
-                if (host != null && (host.equals("accounts.google.com") ||
-                        host.equals("google.com") || host.endsWith(".google.com") ||
-                        host.equals("spotify.com") || host.endsWith(".spotify.com"))) {
-                    Intent intent = new Intent(Intent.ACTION_VIEW, uri);
-                    startActivity(intent);
-                    return true;
-                }
                 return false;
             }
         });
@@ -229,7 +219,6 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         webView.loadUrl(APP_URL);
-        handleOAuthReturnIntent(getIntent());
     }
 
     @Override
@@ -273,41 +262,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public class VibeArcJavascriptInterface {
-        @android.webkit.JavascriptInterface
-        public void launchSecureExternalLogin(String authUrl) {
-            if (authUrl == null || authUrl.length() > 2048) {
-                runOnUiThread(() -> Toast.makeText(
-                        MainActivity.this,
-                        "The Google sign-in link was not valid.",
-                        Toast.LENGTH_LONG
-                ).show());
-                return;
-            }
-            Uri uri = Uri.parse(authUrl);
-            if (!"https".equals(uri.getScheme()) ||
-                    !"vibearc-player.vercel.app".equals(uri.getHost()) ||
-                    !"/api/auth/google/start".equals(uri.getPath()) ||
-                    !"android".equals(uri.getQueryParameter("platform"))) {
-                runOnUiThread(() -> Toast.makeText(
-                        MainActivity.this,
-                        "The Google sign-in link was not valid.",
-                        Toast.LENGTH_LONG
-                ).show());
-                return;
-            }
-            runOnUiThread(() -> {
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, uri));
-                } catch (Exception e) {
-                    Toast.makeText(
-                            MainActivity.this,
-                            "No external browser is available for sign-in.",
-                            Toast.LENGTH_LONG
-                    ).show();
-                }
-            });
-        }
-
         @android.webkit.JavascriptInterface
         public void startVoiceRecognition() {
             runOnUiThread(() -> startNativeVoiceRecognition());
@@ -440,100 +394,6 @@ public class MainActivity extends AppCompatActivity {
             startService(new Intent(MainActivity.this, MediaPlaybackService.class)
                     .setAction(MediaPlaybackService.ACTION_SPEED)
                     .putExtra("value", Math.max(0.5f, Math.min(2f, speed))));
-        }
-    }
-
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        setIntent(intent);
-        handleOAuthReturnIntent(intent);
-    }
-
-    private void handleOAuthReturnIntent(Intent intent) {
-        Uri uri = intent == null ? null : intent.getData();
-        if (uri == null ||
-                !"https".equals(uri.getScheme()) ||
-                !"vibearc-player.vercel.app".equals(uri.getHost()) ||
-                !"/auth/return".equals(uri.getPath())) {
-            return;
-        }
-        String fragment = uri.getFragment();
-        Uri fragmentUri = fragment == null ? null : Uri.parse("https://local.invalid/?" + fragment);
-        String authResult = fragmentUri == null ? null : fragmentUri.getQueryParameter("auth");
-        if ("cancelled".equals(authResult) || "error".equals(authResult)) {
-            setIntent(new Intent(this, MainActivity.class));
-            Toast.makeText(
-                    this,
-                    "cancelled".equals(authResult)
-                            ? "Google sign-in was cancelled."
-                            : "Google sign-in could not be completed.",
-                    Toast.LENGTH_LONG
-            ).show();
-            webView.loadUrl(APP_URL);
-            return;
-        }
-        String handoff = fragmentUri == null ? null : fragmentUri.getQueryParameter("handoff");
-        if (handoff == null || handoff.length() > 4096) {
-            Toast.makeText(this, "The Google sign-in return link is invalid.", Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        setIntent(new Intent(this, MainActivity.class));
-        new Thread(() -> redeemGoogleHandoff(handoff)).start();
-    }
-
-    private void redeemGoogleHandoff(String handoff) {
-        HttpURLConnection connection = null;
-        try {
-            URL url = new URL(APP_ORIGIN + "/api/auth/google/redeem");
-            connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("POST");
-            connection.setConnectTimeout(10000);
-            connection.setReadTimeout(10000);
-            connection.setDoOutput(true);
-            connection.setRequestProperty("Content-Type", "application/json");
-            connection.setRequestProperty("X-VibeArc-Handoff", "android");
-            byte[] payload = new JSONObject().put("handoff", handoff).toString().getBytes("UTF-8");
-            try (OutputStream output = connection.getOutputStream()) {
-                output.write(payload);
-            }
-            int status = connection.getResponseCode();
-            if (status != HttpURLConnection.HTTP_OK) {
-                throw new IllegalStateException("The sign-in handoff expired or was rejected.");
-            }
-            String responseText;
-            try (InputStream input = connection.getInputStream();
-                 java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream()) {
-                byte[] data = new byte[2048];
-                int count;
-                while ((count = input.read(data)) != -1) {
-                    buffer.write(data, 0, count);
-                }
-                responseText = buffer.toString("UTF-8");
-            }
-            String sessionToken = new JSONObject(responseText).getString("sessionToken");
-            String cookie = "vibearc_session=" + sessionToken +
-                    "; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax";
-            android.webkit.CookieManager cookieManager = android.webkit.CookieManager.getInstance();
-            cookieManager.setAcceptCookie(true);
-            cookieManager.setCookie(APP_ORIGIN, cookie, value -> runOnUiThread(() -> {
-                if (value) {
-                    cookieManager.flush();
-                    webView.loadUrl(APP_URL);
-                    Toast.makeText(MainActivity.this, "Google account connected to VibeArc.", Toast.LENGTH_LONG).show();
-                } else {
-                    Toast.makeText(MainActivity.this, "Could not save the VibeArc sign-in.", Toast.LENGTH_LONG).show();
-                }
-            }));
-        } catch (Exception e) {
-            runOnUiThread(() -> Toast.makeText(
-                    MainActivity.this,
-                    "Google sign-in could not be returned to VibeArc. Please try again.",
-                    Toast.LENGTH_LONG
-            ).show());
-        } finally {
-            if (connection != null) connection.disconnect();
         }
     }
 
