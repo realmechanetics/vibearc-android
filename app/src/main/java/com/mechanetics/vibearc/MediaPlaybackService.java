@@ -415,6 +415,7 @@ public final class MediaPlaybackService extends Service {
         }
         broadcastPlaybackState(false, null);
         stopForeground(STOP_FOREGROUND_REMOVE);
+        foregroundStarted = false;
         stopSelf();
     }
 
@@ -725,10 +726,20 @@ public final class MediaPlaybackService extends Service {
     }
 
     @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        stopPlayer();
+        super.onTaskRemoved(rootIntent);
+    }
+
+    @Override
     public void onDestroy() {
         handler.removeCallbacks(positionTicker);
         releasePlayer();
         abandonAudioFocus();
+        if (foregroundStarted) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            foregroundStarted = false;
+        }
         if (receiverRegistered) unregisterReceiver(noisyReceiver);
         if (mediaSession != null) {
             mediaSession.setActive(false);
