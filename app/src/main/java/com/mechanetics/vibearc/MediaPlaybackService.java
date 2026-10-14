@@ -6,11 +6,8 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.Shader;
-import android.graphics.LinearGradient;
 import android.content.Intent;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -603,7 +600,7 @@ public final class MediaPlaybackService extends Service {
         PendingIntent toggle = controlPendingIntent(playing ? "pause" : "play", 2);
         PendingIntent next = controlPendingIntent("next", 3);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.vibearc_notification)
                 .setContentTitle(title)
                 .setContentText(artist)
                 .setSubText(album)
@@ -680,25 +677,10 @@ public final class MediaPlaybackService extends Service {
     }
 
     private Bitmap createVibeArcArtwork() {
-        Bitmap artwork = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(artwork);
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        paint.setShader(new LinearGradient(
-                0,
-                0,
-                512,
-                512,
-                Color.rgb(167, 139, 250),
-                VIBEARC_PURPLE,
-                Shader.TileMode.CLAMP
-        ));
-        canvas.drawRect(0, 0, 512, 512, paint);
-        paint.setShader(null);
-        paint.setColor(Color.WHITE);
-        paint.setTextAlign(Paint.Align.CENTER);
-        paint.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL));
-        paint.setTextSize(210);
-        canvas.drawText("♪", 256, 330, paint);
+        Bitmap artwork = BitmapFactory.decodeResource(getResources(), R.drawable.vibearc_logo);
+        if (artwork == null) {
+            throw new IllegalStateException("VibeArc notification artwork could not be loaded");
+        }
         return artwork;
     }
 
