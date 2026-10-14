@@ -37,6 +37,9 @@ import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import androidx.webkit.WebMessageCompat;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
 
 import java.util.ArrayList;
 import java.io.File;
@@ -45,6 +48,7 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.URL;
 import java.net.URLConnection;
+import java.util.Collections;
 import java.util.List;
 import org.json.JSONObject;
 import org.json.JSONArray;
@@ -132,13 +136,36 @@ public class MainActivity extends AppCompatActivity {
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
         settings.setAllowContentAccess(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            settings.setSafeBrowsingEnabled(true);
+        }
 
         // BREAK AUTOPLAY & SPEAKER SANITY BLOCKS: Unlock native text-to-speech speaker synthesis completely
         settings.setMediaPlaybackRequiresUserGesture(false);
 
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
 
-        webView.addJavascriptInterface(new VibeArcJavascriptInterface(), "AndroidBridge");
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            WebViewCompat.addWebMessageListener(
+                    webView,
+                    "AndroidNativeBridge",
+                    Collections.singleton(APP_ORIGIN),
+                    (view, message, sourceOrigin, isMainFrame, replyProxy) -> {
+                        if (!isMainFrame || !APP_ORIGIN.equals(sourceOrigin.toString())) return;
+                        dispatchNativeBridgeMessage(message);
+                    }
+            );
+        } else {
+            Toast.makeText(
+                    this,
+                    "Update Android System WebView to enable native audio features.",
+                    Toast.LENGTH_LONG
+            ).show();
+        }
 
         webView.setWebViewClient(new WebViewClient() {
 
@@ -190,8 +217,33 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                if (!request.isForMainFrame()) return false;
                 Uri uri = request.getUrl();
-                return false;
+                if (APP_ORIGIN.equals(uri.getScheme() + "://" + uri.getAuthority())) return false;
+                if ("https".equals(uri.getScheme()) && isYouTubeHost(uri.getHost())) {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                    } catch (android.content.ActivityNotFoundException exception) {
+                        Toast.makeText(
+                                MainActivity.this,
+                                "No app is available to open that YouTube link.",
+                                Toast.LENGTH_LONG
+                        ).show();
+                    }
+                }
+                return true;
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                Uri uri = Uri.parse(url);
+                if (APP_ORIGIN.equals(uri.getScheme() + "://" + uri.getAuthority())) {
+                    dispatchAndroidEvent(
+                            "vibearc:android-speech-locale",
+                            JSONObject.quote(activeSpeechLocale)
+                    );
+                }
             }
         });
 
@@ -218,7 +270,24 @@ public class MainActivity extends AppCompatActivity {
                 return true;
             }
         });
-        webView.loadUrl(APP_URL);
+        clearLegacySessionAndLoadApp();
+    }
+
+    private void clearLegacySessionAndLoadApp() {
+        android.webkit.CookieManager cookieManager = android.webkit.CookieManager.getInstance();
+        cookieManager.setAcceptCookie(true);
+        cookieManager.setCookie(
+                APP_ORIGIN,
+                "vibearc_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+                cleared -> runOnUiThread(() -> {
+                    if (webView == null) return;
+                    cookieManager.flush();
+                    if (!cleared) {
+                        android.util.Log.e("VibeArc", "Could not clear the obsolete sign-in session cookie.");
+                    }
+                    webView.loadUrl(APP_URL);
+                })
+        );
     }
 
     @Override
@@ -261,140 +330,163 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
     }
 
-    public class VibeArcJavascriptInterface {
-        @android.webkit.JavascriptInterface
-        public void startVoiceRecognition() {
-            runOnUiThread(() -> startNativeVoiceRecognition());
+    private void dispatchNativeBridgeMessage(WebMessageCompat message) {
+        String payload = message.getData();
+        if (payload == null || payload.length() > 16384) {
+            android.util.Log.w("VibeArc", "Rejected an oversized Android bridge message.");
+            return;
         }
-
-        @android.webkit.JavascriptInterface
-        public void stopVoiceRecognition() {
-            runOnUiThread(() -> stopNativeVoiceRecognition(true));
+        try {
+            JSONObject command = new JSONObject(payload);
+            String method = command.optString("method");
+            JSONArray args = command.optJSONArray("args");
+            if (method.isEmpty() || args == null || args.length() > 2) {
+                android.util.Log.w("VibeArc", "Rejected a malformed Android bridge message.");
+                return;
+            }
+            runOnUiThread(() -> handleNativeBridgeCommand(method, args));
+        } catch (Exception exception) {
+            android.util.Log.w("VibeArc", "Rejected an invalid Android bridge message.", exception);
         }
+    }
 
-        @android.webkit.JavascriptInterface
-        public String getSpeechLocale() {
-            return activeSpeechLocale;
-        }
-
-        @android.webkit.JavascriptInterface
-        public boolean setSpeechLocale(String locale) {
-            if (!isSupportedSpeechLocale(locale)) return false;
-            activeSpeechLocale = locale;
-            getSharedPreferences(SPEECH_PREFERENCES, MODE_PRIVATE)
-                    .edit()
-                    .putString(SPEECH_LOCALE, locale)
-                    .apply();
-            return true;
-        }
-
-        @android.webkit.JavascriptInterface
-        public void checkOnDeviceSpeechModel(String locale) {
-            runOnUiThread(() -> checkOnDeviceSpeechModelOnMainThread(locale));
-        }
-
-        @android.webkit.JavascriptInterface
-        public void downloadOnDeviceSpeechModel(String locale) {
-            runOnUiThread(() -> requestOnDeviceSpeechModelDownload(locale));
-        }
-
-        @android.webkit.JavascriptInterface
-        public void openSpeechSettings() {
-            runOnUiThread(() -> {
+    private void handleNativeBridgeCommand(String method, JSONArray args) {
+        switch (method) {
+            case "startVoiceRecognition":
+                startNativeVoiceRecognition();
+                break;
+            case "stopVoiceRecognition":
+                stopNativeVoiceRecognition(true);
+                break;
+            case "setSpeechLocale":
+                String locale = args.optString(0, "");
+                if (!isSupportedSpeechLocale(locale)) return;
+                activeSpeechLocale = locale;
+                getSharedPreferences(SPEECH_PREFERENCES, MODE_PRIVATE)
+                        .edit()
+                        .putString(SPEECH_LOCALE, locale)
+                        .apply();
+                break;
+            case "checkOnDeviceSpeechModel":
+                checkOnDeviceSpeechModelOnMainThread(args.optString(0, ""));
+                break;
+            case "downloadOnDeviceSpeechModel":
+                requestOnDeviceSpeechModelDownload(args.optString(0, ""));
+                break;
+            case "openSpeechSettings":
                 try {
                     startActivity(new Intent(Settings.ACTION_VOICE_INPUT_SETTINGS));
                 } catch (Exception exception) {
-                    Toast.makeText(MainActivity.this, "Open your Android speech input settings to manage voice services.", Toast.LENGTH_LONG).show();
+                    Toast.makeText(
+                            this,
+                            "Open your Android speech input settings to manage voice services.",
+                            Toast.LENGTH_LONG
+                    ).show();
                 }
-            });
+                break;
+            case "scanDeviceAudio":
+                if (hasAudioLibraryPermission()) {
+                    scanDeviceAudioFiles();
+                } else {
+                    requestAudioLibraryPermission();
+                }
+                break;
+            case "playDeviceAudio":
+                playDeviceAudio(args.optString(0, ""));
+                break;
+            case "controlDeviceAudio":
+                controlDeviceAudio(args.optString(0, ""), args.optDouble(1, Double.NaN));
+                break;
+            case "updateDeviceAudioFilters":
+                updateDeviceAudioFilters(args.optString(0, ""));
+                break;
+            case "setDeviceAudioVolume":
+                setDeviceAudioVolume(args.optDouble(0, Double.NaN));
+                break;
+            case "setDeviceAudioSpeed":
+                setDeviceAudioSpeed(args.optDouble(0, Double.NaN));
+                break;
+            default:
+                android.util.Log.w("VibeArc", "Rejected an unknown Android bridge method.");
         }
+    }
 
-        @android.webkit.JavascriptInterface
-        public boolean isInternetAvailable() {
-            return MainActivity.this.isNetworkAvailable();
-        }
-
-        @android.webkit.JavascriptInterface
-        public void scanDeviceAudio() {
-            if (!hasAudioLibraryPermission()) {
-                runOnUiThread(() -> requestAudioLibraryPermission());
+    private void playDeviceAudio(String trackJson) {
+        if (trackJson.length() > 8192) return;
+        try {
+            JSONObject track = new JSONObject(trackJson);
+            Uri uri = Uri.parse(track.optString("uri", ""));
+            if (!"content".equals(uri.getScheme()) ||
+                    !"media".equals(uri.getAuthority()) ||
+                    uri.getPath() == null ||
+                    !uri.getPath().startsWith("/external/audio/media/")) {
+                dispatchAndroidEvent(
+                        "vibearc:android-audio-playback",
+                        "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"The selected device audio file is invalid.\"}"
+                );
                 return;
             }
-            scanDeviceAudioFiles();
+            requestNotificationPermissionOrPlay(trackJson);
+        } catch (Exception exception) {
+            dispatchAndroidEvent(
+                    "vibearc:android-audio-playback",
+                    "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"The selected device audio file could not be opened.\"}"
+            );
         }
+    }
 
-        @android.webkit.JavascriptInterface
-        public void playDeviceAudio(String trackJson) {
-            if (trackJson == null || trackJson.length() > 8192) return;
-            try {
-                JSONObject track = new JSONObject(trackJson);
-                Uri uri = Uri.parse(track.optString("uri", ""));
-                if (!"content".equals(uri.getScheme()) ||
-                        !"media".equals(uri.getAuthority()) ||
-                        uri.getPath() == null ||
-                        !uri.getPath().startsWith("/external/audio/media/")) {
-                    dispatchAndroidEvent(
-                            "vibearc:android-audio-playback",
-                            "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"The selected device audio file is invalid.\"}"
-                    );
-                    return;
-                }
-                runOnUiThread(() -> requestNotificationPermissionOrPlay(trackJson));
-            } catch (Exception e) {
-                dispatchAndroidEvent(
-                        "vibearc:android-audio-playback",
-                        "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"The selected device audio file could not be opened.\"}"
-                );
-            }
+    private void controlDeviceAudio(String action, double positionSeconds) {
+        if (!("play".equals(action) || "pause".equals(action) ||
+                "stop".equals(action) || "next".equals(action) ||
+                "previous".equals(action) || "seek-to".equals(action) ||
+                "seek-forward".equals(action) || "seek-backward".equals(action)) ||
+                !Double.isFinite(positionSeconds)) {
+            return;
         }
+        Intent service = new Intent(this, MediaPlaybackService.class)
+                .putExtra("control", action)
+                .putExtra("position", (long) (Math.max(0, Math.min(86400, positionSeconds)) * 1000));
+        startService(service);
+    }
 
-        @android.webkit.JavascriptInterface
-        public void controlDeviceAudio(String action, double positionSeconds) {
-            if (action == null || !(
-                    "play".equals(action) || "pause".equals(action) ||
-                            "stop".equals(action) || "next".equals(action) ||
-                            "previous".equals(action) || "seek-to".equals(action) ||
-                            "seek-forward".equals(action) || "seek-backward".equals(action)
-            )) return;
-            Intent service = new Intent(MainActivity.this, MediaPlaybackService.class)
-                    .putExtra("control", action)
-                    .putExtra(
-                            "position",
-                            (long) (Math.max(0, Math.min(86400, positionSeconds)) * 1000)
-                    );
+    private void updateDeviceAudioFilters(String filters) {
+        if (filters.length() > 2048) return;
+        try {
+            new JSONObject(filters);
+            Intent service = new Intent(this, MediaPlaybackService.class)
+                    .setAction(MediaPlaybackService.ACTION_FILTERS)
+                    .putExtra("filters", filters);
             startService(service);
+        } catch (Exception exception) {
+            dispatchAndroidEvent(
+                    "vibearc:android-audio-playback",
+                    "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"Audio filter settings were invalid.\"}"
+            );
         }
+    }
 
-        @android.webkit.JavascriptInterface
-        public void updateDeviceAudioFilters(String filters) {
-            if (filters == null || filters.length() > 2048) return;
-            try {
-                new JSONObject(filters);
-                Intent service = new Intent(MainActivity.this, MediaPlaybackService.class)
-                        .setAction(MediaPlaybackService.ACTION_FILTERS)
-                        .putExtra("filters", filters);
-                startService(service);
-            } catch (Exception e) {
-                dispatchAndroidEvent(
-                        "vibearc:android-audio-playback",
-                        "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"Audio filter settings were invalid.\"}"
-                );
-            }
-        }
+    private void setDeviceAudioVolume(double volume) {
+        if (!Double.isFinite(volume)) return;
+        startService(new Intent(this, MediaPlaybackService.class)
+                .setAction(MediaPlaybackService.ACTION_VOLUME)
+                .putExtra("value", (float) Math.max(0, Math.min(1, volume))));
+    }
 
-        @android.webkit.JavascriptInterface
-        public void setDeviceAudioVolume(float volume) {
-            startService(new Intent(MainActivity.this, MediaPlaybackService.class)
-                    .setAction(MediaPlaybackService.ACTION_VOLUME)
-                    .putExtra("value", Math.max(0f, Math.min(1f, volume))));
-        }
+    private void setDeviceAudioSpeed(double speed) {
+        if (!Double.isFinite(speed)) return;
+        startService(new Intent(this, MediaPlaybackService.class)
+                .setAction(MediaPlaybackService.ACTION_SPEED)
+                .putExtra("value", (float) Math.max(0.5, Math.min(2, speed))));
+    }
 
-        @android.webkit.JavascriptInterface
-        public void setDeviceAudioSpeed(float speed) {
-            startService(new Intent(MainActivity.this, MediaPlaybackService.class)
-                    .setAction(MediaPlaybackService.ACTION_SPEED)
-                    .putExtra("value", Math.max(0.5f, Math.min(2f, speed))));
-        }
+    private boolean isYouTubeHost(String host) {
+        return host != null && (
+                "youtube.com".equals(host) ||
+                        host.endsWith(".youtube.com") ||
+                        "youtube-nocookie.com".equals(host) ||
+                        host.endsWith(".youtube-nocookie.com") ||
+                        "youtu.be".equals(host)
+        );
     }
 
     private boolean hasMicrophonePermission() {
