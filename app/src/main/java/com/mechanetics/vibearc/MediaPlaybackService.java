@@ -14,7 +14,6 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.media.audiofx.BassBoost;
 import android.media.audiofx.Equalizer;
-import android.media.audiofx.PresetReverb;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -67,7 +66,6 @@ public final class MediaPlaybackService extends Service {
     private MediaPlayer player;
     private Equalizer equalizer;
     private BassBoost bassBoost;
-    private PresetReverb reverb;
     private AudioManager audioManager;
     private AudioManager.OnAudioFocusChangeListener focusChangeListener;
     private boolean receiverRegistered;
@@ -500,30 +498,6 @@ public final class MediaPlaybackService extends Service {
             }
         }
 
-        try {
-            reverb = new PresetReverb(1000, sessionId);
-            reverb.setPreset(PresetReverb.PRESET_SMALLROOM);
-            reverb.setEnabled(filters.optBoolean("reverb", false));
-            if (filters.optBoolean("reverb", false)) {
-                player.attachAuxEffect(reverb.getId());
-                player.setAuxEffectSendLevel(1.0f);
-            } else {
-                player.setAuxEffectSendLevel(0f);
-            }
-        } catch (Exception exception) {
-            if (reverb != null) {
-                reverb.release();
-                reverb = null;
-            }
-            try {
-                player.setAuxEffectSendLevel(0f);
-            } catch (IllegalStateException ignored) {
-                // The player may be releasing while its native effect is attached.
-            }
-            if (filters.optBoolean("reverb", false)) {
-                filterError = "Room reverb is not supported by this device.";
-            }
-        }
         if (filterError != null) {
             broadcastPlaybackState(false, filterError);
         }
@@ -537,10 +511,6 @@ public final class MediaPlaybackService extends Service {
         if (bassBoost != null) {
             bassBoost.release();
             bassBoost = null;
-        }
-        if (reverb != null) {
-            reverb.release();
-            reverb = null;
         }
     }
 
