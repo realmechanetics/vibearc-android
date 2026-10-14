@@ -3,8 +3,12 @@ package com.mechanetics.vibearc;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.Intent;
+import android.content.BroadcastReceiver;
+import android.content.ContentUris;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,6 +23,8 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
+import android.database.Cursor;
+import android.provider.MediaStore;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
@@ -34,6 +40,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 
 public class MainActivity extends AppCompatActivity {
@@ -41,6 +48,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String APP_URL = "https://vibearc-player.vercel.app/";
     private static final String APP_ORIGIN = "https://vibearc-player.vercel.app";
     private static final int MICROPHONE_PERMISSION_REQUEST_CODE = 101;
+    private static final int AUDIO_LIBRARY_PERMISSION_REQUEST_CODE = 103;
+    private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 104;
     private PermissionRequest currentPermissionRequest;
 
     private WebView webView;
@@ -49,6 +58,41 @@ public class MainActivity extends AppCompatActivity {
     private boolean pendingNativeVoiceRecognition;
     private boolean microphonePermissionPending;
     private boolean suppressSpeechCallbacks;
+    private boolean keepWebViewActiveForAudio;
+    private boolean mediaControlReceiverRegistered;
+    private String pendingNativePlaybackTrack;
+    private boolean activityResumed;
+    private boolean nativePlaybackServiceActive;
+    private Boolean lastReportedActivityVisibility;
+
+    private final BroadcastReceiver mediaControlReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(android.content.Context context, Intent intent) {
+            if ("com.mechanetics.vibearc.PLAYBACK_STATE".equals(intent.getAction())) {
+                String detail = intent.getStringExtra("detail");
+                if (detail != null) {
+                    try {
+                        JSONObject state = new JSONObject(detail);
+                        keepWebViewActiveForAudio = state.optBoolean("playing", false);
+                        nativePlaybackServiceActive = state.optBoolean("active", false);
+                        if (!nativePlaybackServiceActive) lastReportedActivityVisibility = null;
+                    } catch (Exception ignored) {
+                        keepWebViewActiveForAudio = false;
+                        nativePlaybackServiceActive = false;
+                        lastReportedActivityVisibility = null;
+                    }
+                    dispatchAndroidEvent("vibearc:android-audio-playback", detail);
+                    reportNativePlaybackActivityVisibility();
+                }
+                return;
+            }
+            String control = intent.getStringExtra("control");
+            if (control != null) dispatchAndroidEvent(
+                    "vibearc:android-media-control",
+                    JSONObject.quote(control)
+            );
+        }
+    };
 
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -58,11 +102,21 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         webView = findViewById(R.id.vibearc_webview);
+        IntentFilter mediaFilter = new IntentFilter(MediaPlaybackService.ACTION_CONTROL);
+        mediaFilter.addAction("com.mechanetics.vibearc.PLAYBACK_STATE");
+        androidx.core.content.ContextCompat.registerReceiver(
+                this,
+                mediaControlReceiver,
+                mediaFilter,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        );
+        mediaControlReceiverRegistered = true;
 
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
+        settings.setAllowContentAccess(true);
 
         // BREAK AUTOPLAY & SPEAKER SANITY BLOCKS: Unlock native text-to-speech speaker synthesis completely
         settings.setMediaPlaybackRequiresUserGesture(false);
@@ -164,13 +218,15 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onPause() {
+        activityResumed = false;
+        reportNativePlaybackActivityVisibility();
         if (!microphonePermissionPending) stopNativeVoiceRecognition(false);
         if (webView != null) {
             webView.evaluateJavascript(
                     "window.dispatchEvent(new Event('vibearc:pause-embedded-media'))",
                     null
             );
-            webView.onPause();
+            if (!keepWebViewActiveForAudio) webView.onPause();
         }
         super.onPause();
     }
@@ -178,9 +234,11 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        activityResumed = true;
         if (webView != null) {
             webView.onResume();
         }
+        reportNativePlaybackActivityVisibility();
     }
 
     @Override
@@ -189,6 +247,10 @@ public class MainActivity extends AppCompatActivity {
         if (speechRecognizer != null) {
             speechRecognizer.destroy();
             speechRecognizer = null;
+        }
+        if (mediaControlReceiverRegistered) {
+            unregisterReceiver(mediaControlReceiver);
+            mediaControlReceiverRegistered = false;
         }
         super.onDestroy();
     }
@@ -237,6 +299,88 @@ public class MainActivity extends AppCompatActivity {
         @android.webkit.JavascriptInterface
         public void stopVoiceRecognition() {
             runOnUiThread(() -> stopNativeVoiceRecognition(true));
+        }
+
+        @android.webkit.JavascriptInterface
+        public void scanDeviceAudio() {
+            if (!hasAudioLibraryPermission()) {
+                runOnUiThread(() -> requestAudioLibraryPermission());
+                return;
+            }
+            scanDeviceAudioFiles();
+        }
+
+        @android.webkit.JavascriptInterface
+        public void playDeviceAudio(String trackJson) {
+            if (trackJson == null || trackJson.length() > 8192) return;
+            try {
+                JSONObject track = new JSONObject(trackJson);
+                Uri uri = Uri.parse(track.optString("uri", ""));
+                if (!"content".equals(uri.getScheme()) ||
+                        !"media".equals(uri.getAuthority()) ||
+                        uri.getPath() == null ||
+                        !uri.getPath().startsWith("/external/audio/media/")) {
+                    dispatchAndroidEvent(
+                            "vibearc:android-audio-playback",
+                            "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"The selected device audio file is invalid.\"}"
+                    );
+                    return;
+                }
+                runOnUiThread(() -> requestNotificationPermissionOrPlay(trackJson));
+            } catch (Exception e) {
+                dispatchAndroidEvent(
+                        "vibearc:android-audio-playback",
+                        "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"The selected device audio file could not be opened.\"}"
+                );
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        public void controlDeviceAudio(String action, double positionSeconds) {
+            if (action == null || !(
+                    "play".equals(action) || "pause".equals(action) ||
+                            "stop".equals(action) || "next".equals(action) ||
+                            "previous".equals(action) || "seek-to".equals(action) ||
+                            "seek-forward".equals(action) || "seek-backward".equals(action)
+            )) return;
+            Intent service = new Intent(MainActivity.this, MediaPlaybackService.class)
+                    .putExtra("control", action)
+                    .putExtra(
+                            "position",
+                            (long) (Math.max(0, Math.min(86400, positionSeconds)) * 1000)
+                    );
+            startService(service);
+        }
+
+        @android.webkit.JavascriptInterface
+        public void updateDeviceAudioFilters(String filters) {
+            if (filters == null || filters.length() > 2048) return;
+            try {
+                new JSONObject(filters);
+                Intent service = new Intent(MainActivity.this, MediaPlaybackService.class)
+                        .setAction(MediaPlaybackService.ACTION_FILTERS)
+                        .putExtra("filters", filters);
+                startService(service);
+            } catch (Exception e) {
+                dispatchAndroidEvent(
+                        "vibearc:android-audio-playback",
+                        "{\"playing\":false,\"position\":0,\"duration\":0,\"error\":\"Audio filter settings were invalid.\"}"
+                );
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        public void setDeviceAudioVolume(float volume) {
+            startService(new Intent(MainActivity.this, MediaPlaybackService.class)
+                    .setAction(MediaPlaybackService.ACTION_VOLUME)
+                    .putExtra("value", Math.max(0f, Math.min(1f, volume))));
+        }
+
+        @android.webkit.JavascriptInterface
+        public void setDeviceAudioSpeed(float speed) {
+            startService(new Intent(MainActivity.this, MediaPlaybackService.class)
+                    .setAction(MediaPlaybackService.ACTION_SPEED)
+                    .putExtra("value", Math.max(0.5f, Math.min(2f, speed))));
         }
     }
 
@@ -348,6 +492,91 @@ public class MainActivity extends AppCompatActivity {
         );
     }
 
+    private boolean hasAudioLibraryPermission() {
+        String permission = Build.VERSION.SDK_INT >= 33
+                ? "android.permission.READ_MEDIA_AUDIO"
+                : Manifest.permission.READ_EXTERNAL_STORAGE;
+        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestAudioLibraryPermission() {
+        String permission = Build.VERSION.SDK_INT >= 33
+                ? "android.permission.READ_MEDIA_AUDIO"
+                : Manifest.permission.READ_EXTERNAL_STORAGE;
+        ActivityCompat.requestPermissions(
+                this,
+                new String[]{permission},
+                AUDIO_LIBRARY_PERMISSION_REQUEST_CODE
+        );
+    }
+
+    private void scanDeviceAudioFiles() {
+        new Thread(() -> {
+            JSONArray audioFiles = new JSONArray();
+            try {
+                Uri collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                ArrayList<String> projection = new ArrayList<>();
+                projection.add(MediaStore.Audio.Media._ID);
+                projection.add(MediaStore.Audio.Media.TITLE);
+                projection.add(MediaStore.Audio.Media.ARTIST);
+                projection.add(MediaStore.Audio.Media.ALBUM);
+                projection.add(MediaStore.Audio.Media.DURATION);
+                projection.add(MediaStore.Audio.Media.IS_MUSIC);
+                projection.add(MediaStore.Audio.Media.DATA);
+                if (Build.VERSION.SDK_INT >= 29) {
+                    projection.add(MediaStore.Audio.Media.RELATIVE_PATH);
+                }
+                String[] columns = projection.toArray(new String[0]);
+                try (Cursor cursor = getContentResolver().query(
+                        collection,
+                        columns,
+                        MediaStore.Audio.Media.IS_MUSIC + " != 0",
+                        null,
+                        MediaStore.Audio.Media.TITLE + " COLLATE NOCASE ASC"
+                )) {
+                    if (cursor != null) {
+                        int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
+                        int titleColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE);
+                        int artistColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST);
+                        int albumColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM);
+                        int durationColumn = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION);
+                        int dataColumn = cursor.getColumnIndex(MediaStore.Audio.Media.DATA);
+                        int folderColumn = Build.VERSION.SDK_INT >= 29
+                                ? cursor.getColumnIndex(MediaStore.Audio.Media.RELATIVE_PATH)
+                                : -1;
+                        while (cursor.moveToNext()) {
+                            long id = cursor.getLong(idColumn);
+                            Uri contentUri = ContentUris.withAppendedId(collection, id);
+                            String folder = folderColumn >= 0 ? cursor.getString(folderColumn) : null;
+                            if ((folder == null || folder.isEmpty()) && dataColumn >= 0) {
+                                String path = cursor.getString(dataColumn);
+                                if (path != null) folder = new File(path).getParent();
+                            }
+                            if (folder == null || folder.isEmpty()) folder = "Music";
+                            folder = folder.replace('\\', '/').replaceAll("/+$", "");
+                            JSONObject item = new JSONObject();
+                            item.put("id", "android-media-" + id);
+                            item.put("title", cursor.getString(titleColumn));
+                            item.put("artist", cursor.getString(artistColumn));
+                            item.put("album", cursor.getString(albumColumn));
+                            item.put("durationSeconds", cursor.getLong(durationColumn) / 1000.0);
+                            item.put("folder", folder);
+                            item.put("uri", contentUri.toString());
+                            audioFiles.put(item);
+                        }
+                    }
+                }
+                JSONObject detail = new JSONObject().put("tracks", audioFiles);
+                dispatchAndroidEvent("vibearc:android-audio-library", detail.toString());
+            } catch (Exception exception) {
+                dispatchAndroidEvent(
+                        "vibearc:android-audio-library",
+                        "{\"error\":\"VibeArc could not scan the device audio library.\"}"
+                );
+            }
+        }, "vibearc-media-scan").start();
+    }
+
     private void requestWebViewAudioPermission(PermissionRequest request) {
         boolean requestsAudio = false;
         for (String resource : request.getResources()) {
@@ -448,11 +677,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void dispatchAndroidSpeechEvent(String eventName, String value) {
-        if (webView == null) return;
         String detailKey = eventName.endsWith("-result") ? "transcript" : "error";
         String detail = value == null
                 ? "{}"
                 : "{\"" + detailKey + "\":" + JSONObject.quote(value) + "}";
+        dispatchAndroidEvent(eventName, detail);
+    }
+
+    private void dispatchAndroidEvent(String eventName, String detail) {
+        if (webView == null) return;
         String script = "window.dispatchEvent(new CustomEvent("
                 + JSONObject.quote(eventName)
                 + ",{detail:"
@@ -463,6 +696,18 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    private void reportNativePlaybackActivityVisibility() {
+        if (!nativePlaybackServiceActive ||
+                (lastReportedActivityVisibility != null &&
+                        lastReportedActivityVisibility == activityResumed)) {
+            return;
+        }
+        lastReportedActivityVisibility = activityResumed;
+        startService(new Intent(this, MediaPlaybackService.class)
+                .setAction(MediaPlaybackService.ACTION_ACTIVITY_VISIBILITY)
+                .putExtra("foreground", activityResumed));
+    }
+
     private void grantWebViewAudioAccess() {
         if (currentPermissionRequest != null) {
             String[] audioResources = {PermissionRequest.RESOURCE_AUDIO_CAPTURE};
@@ -471,9 +716,62 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void requestNotificationPermissionOrPlay(String trackJson) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")
+                        != PackageManager.PERMISSION_GRANTED) {
+            pendingNativePlaybackTrack = trackJson;
+            ActivityCompat.requestPermissions(
+                    this,
+                    new String[]{"android.permission.POST_NOTIFICATIONS"},
+                    NOTIFICATION_PERMISSION_REQUEST_CODE
+            );
+            return;
+        }
+        startNativeDeviceAudio(trackJson);
+    }
+
+    private void startNativeDeviceAudio(String trackJson) {
+        Intent service = new Intent(this, MediaPlaybackService.class)
+                .setAction(MediaPlaybackService.ACTION_PLAY)
+                .putExtra("track", trackJson);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(service);
+        } else {
+            startService(service);
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == NOTIFICATION_PERMISSION_REQUEST_CODE) {
+            String trackJson = pendingNativePlaybackTrack;
+            pendingNativePlaybackTrack = null;
+            if (trackJson != null) {
+                if (Build.VERSION.SDK_INT >= 33 &&
+                        ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")
+                                != PackageManager.PERMISSION_GRANTED) {
+                    Toast.makeText(
+                            this,
+                            "Playback will continue, but lock-screen controls may be unavailable without notifications.",
+                            Toast.LENGTH_LONG
+                    ).show();
+                }
+                startNativeDeviceAudio(trackJson);
+            }
+        }
+        if (requestCode == AUDIO_LIBRARY_PERMISSION_REQUEST_CODE) {
+            boolean permissionGranted = hasAudioLibraryPermission();
+            if (permissionGranted) {
+                scanDeviceAudioFiles();
+            } else {
+                dispatchAndroidEvent(
+                        "vibearc:android-audio-library",
+                        "{\"error\":\"Allow audio access to scan music on this device.\"}"
+                );
+            }
+        }
         if (requestCode == MICROPHONE_PERMISSION_REQUEST_CODE) {
             microphonePermissionPending = false;
             boolean audioApproved = false;
