@@ -25,6 +25,9 @@ import android.webkit.WebViewClient;
 import android.widget.Toast;
 import android.database.Cursor;
 import android.provider.MediaStore;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
@@ -41,6 +44,12 @@ import java.net.URL;
 import java.net.URLConnection;
 import org.json.JSONObject;
 import org.json.JSONArray;
+import org.vosk.Model;
+import org.vosk.Recognizer;
+import org.vosk.android.SpeechService;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 
 public class MainActivity extends AppCompatActivity {
@@ -64,6 +73,13 @@ public class MainActivity extends AppCompatActivity {
     private boolean activityResumed;
     private boolean nativePlaybackServiceActive;
     private Boolean lastReportedActivityVisibility;
+    private OfflineSpeechModelManager offlineSpeechModels;
+    private volatile Model voskModel;
+    private volatile String voskModelId;
+    private SpeechService voskSpeechService;
+    private Recognizer voskRecognizer;
+    private final ExecutorService speechModelLoader = Executors.newSingleThreadExecutor();
+    private int speechRequestId;
 
     private final BroadcastReceiver mediaControlReceiver = new BroadcastReceiver() {
         @Override
@@ -102,6 +118,10 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         webView = findViewById(R.id.vibearc_webview);
+        offlineSpeechModels = new OfflineSpeechModelManager(
+                this,
+                detail -> dispatchAndroidEvent("vibearc:offline-speech-models", detail)
+        );
         IntentFilter mediaFilter = new IntentFilter(MediaPlaybackService.ACTION_CONTROL);
         mediaFilter.addAction("com.mechanetics.vibearc.PLAYBACK_STATE");
         androidx.core.content.ContextCompat.registerReceiver(
@@ -248,6 +268,13 @@ public class MainActivity extends AppCompatActivity {
             speechRecognizer.destroy();
             speechRecognizer = null;
         }
+        if (offlineSpeechModels != null) offlineSpeechModels.close();
+        speechModelLoader.shutdownNow();
+        if (voskModel != null) {
+            voskModel.close();
+            voskModel = null;
+            voskModelId = null;
+        }
         if (mediaControlReceiverRegistered) {
             unregisterReceiver(mediaControlReceiver);
             mediaControlReceiverRegistered = false;
@@ -299,6 +326,43 @@ public class MainActivity extends AppCompatActivity {
         @android.webkit.JavascriptInterface
         public void stopVoiceRecognition() {
             runOnUiThread(() -> stopNativeVoiceRecognition(true));
+        }
+
+        @android.webkit.JavascriptInterface
+        public String getOfflineSpeechModels() {
+            return offlineSpeechModels == null ? "{\"models\":[]}" : offlineSpeechModels.getStateJson();
+        }
+
+        @android.webkit.JavascriptInterface
+        public void downloadOfflineSpeechModel(String modelId) {
+            if (offlineSpeechModels != null) offlineSpeechModels.download(modelId);
+        }
+
+        @android.webkit.JavascriptInterface
+        public boolean selectOfflineSpeechModel(String modelId) {
+            return offlineSpeechModels != null && offlineSpeechModels.select(modelId);
+        }
+
+        @android.webkit.JavascriptInterface
+        public void removeOfflineSpeechModel(String modelId) {
+            runOnUiThread(() -> {
+                if (offlineSpeechModels == null) return;
+                if (modelId != null && modelId.equals(voskModelId)) {
+                    stopNativeVoiceRecognition(false);
+                    releaseVoskModel();
+                }
+                if (!offlineSpeechModels.remove(modelId)) {
+                    offlineSpeechModels.reportError(
+                            modelId,
+                            "Could not remove that speech language pack."
+                    );
+                }
+            });
+        }
+
+        @android.webkit.JavascriptInterface
+        public boolean isInternetAvailable() {
+            return MainActivity.this.isNetworkAvailable();
         }
 
         @android.webkit.JavascriptInterface
@@ -604,13 +668,22 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         pendingNativeVoiceRecognition = false;
+        stopNativeVoiceRecognition(false);
+        suppressSpeechCallbacks = false;
+        if (speechRecognizer != null) {
+            speechRecognizer.destroy();
+            speechRecognizer = null;
+        }
+        if (!isNetworkAvailable()) {
+            startOfflineVoiceRecognition();
+            return;
+        }
+        releaseVoskModel();
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             dispatchAndroidSpeechEvent("vibearc:android-speech-error", "unavailable");
             return;
         }
 
-        if (speechRecognizer != null) speechRecognizer.destroy();
-        suppressSpeechCallbacks = false;
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
             @Override
@@ -635,7 +708,15 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onError(int error) {
                 if (!suppressSpeechCallbacks) {
-                    dispatchAndroidSpeechEvent("vibearc:android-speech-error", "recognition");
+                    if (isNetworkAvailable()) {
+                        dispatchAndroidSpeechEvent("vibearc:android-speech-error", "recognition");
+                    } else {
+                        if (speechRecognizer != null) {
+                            speechRecognizer.destroy();
+                            speechRecognizer = null;
+                        }
+                        startNativeVoiceRecognition();
+                    }
                 }
             }
 
@@ -663,14 +744,127 @@ public class MainActivity extends AppCompatActivity {
         try {
             speechRecognizer.startListening(intent);
         } catch (RuntimeException e) {
-            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "unavailable");
+            if (isNetworkAvailable()) {
+                dispatchAndroidSpeechEvent("vibearc:android-speech-error", "unavailable");
+            } else {
+                startNativeVoiceRecognition();
+            }
+        }
+    }
+
+    private void startOfflineVoiceRecognition() {
+        String modelId = offlineSpeechModels == null ? null : offlineSpeechModels.activeModelId();
+        if (modelId == null || !offlineSpeechModels.isInstalled(modelId)) {
+            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "offline-model-required");
+            return;
+        }
+        int requestId = ++speechRequestId;
+        if (voskModel != null && modelId.equals(voskModelId)) {
+            startVoskListening(requestId);
+            return;
+        }
+        releaseVoskModel();
+
+        File modelDirectory = offlineSpeechModels.modelDirectory(modelId);
+        speechModelLoader.execute(() -> {
+            try {
+                Model loadedModel = new Model(modelDirectory.getAbsolutePath());
+                runOnUiThread(() -> {
+                    if (requestId != speechRequestId || isFinishing() || isDestroyed()) {
+                        loadedModel.close();
+                        return;
+                    }
+                    voskModel = loadedModel;
+                    voskModelId = modelId;
+                    startVoskListening(requestId);
+                });
+            } catch (Exception exception) {
+                runOnUiThread(() -> {
+                    if (requestId == speechRequestId) {
+                        dispatchAndroidSpeechEvent("vibearc:android-speech-error", "offline-model-failed");
+                    }
+                });
+            }
+        });
+    }
+
+    private void startVoskListening(int requestId) {
+        try {
+            voskRecognizer = new Recognizer(voskModel, 16000.0f);
+            voskSpeechService = new SpeechService(voskRecognizer, 16000.0f);
+            voskSpeechService.startListening(new org.vosk.android.RecognitionListener() {
+                @Override
+                public void onPartialResult(String hypothesis) { }
+
+                @Override
+                public void onResult(String hypothesis) { }
+
+                @Override
+                public void onFinalResult(String hypothesis) {
+                    String transcript = "";
+                    try {
+                        transcript = new JSONObject(hypothesis).optString("text", "").trim();
+                    } catch (Exception ignored) {
+                        transcript = "";
+                    }
+                    String finalTranscript = transcript;
+                    runOnUiThread(() -> {
+                        if (requestId != speechRequestId || suppressSpeechCallbacks) return;
+                        stopNativeVoiceRecognition(false);
+                        if (finalTranscript.isEmpty()) {
+                            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "no-speech");
+                        } else {
+                            dispatchAndroidSpeechEvent("vibearc:android-speech-result", finalTranscript);
+                        }
+                    });
+                }
+
+                @Override
+                public void onError(Exception exception) {
+                    runOnUiThread(() -> {
+                        if (requestId != speechRequestId || suppressSpeechCallbacks) return;
+                        stopNativeVoiceRecognition(false);
+                        dispatchAndroidSpeechEvent("vibearc:android-speech-error", "recognition");
+                    });
+                }
+
+                @Override
+                public void onTimeout() {
+                    runOnUiThread(() -> {
+                        if (requestId != speechRequestId || suppressSpeechCallbacks) return;
+                        stopNativeVoiceRecognition(false);
+                        dispatchAndroidSpeechEvent("vibearc:android-speech-ended", null);
+                    });
+                }
+            });
+        } catch (Exception exception) {
+            stopNativeVoiceRecognition(false);
+            dispatchAndroidSpeechEvent("vibearc:android-speech-error", "offline-model-failed");
+        }
+    }
+
+    private void releaseVoskModel() {
+        if (voskModel != null) {
+            voskModel.close();
+            voskModel = null;
+            voskModelId = null;
         }
     }
 
     private void stopNativeVoiceRecognition(boolean notifyWeb) {
+        speechRequestId++;
         pendingNativeVoiceRecognition = false;
         suppressSpeechCallbacks = true;
         if (speechRecognizer != null) speechRecognizer.cancel();
+        if (voskSpeechService != null) {
+            voskSpeechService.stop();
+            voskSpeechService.shutdown();
+            voskSpeechService = null;
+        }
+        if (voskRecognizer != null) {
+            voskRecognizer.close();
+            voskRecognizer = null;
+        }
         if (notifyWeb) {
             dispatchAndroidSpeechEvent("vibearc:android-speech-ended", null);
         }
@@ -830,9 +1024,12 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean isNetworkAvailable() {
         try {
-            android.net.ConnectivityManager cm = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
-            android.net.NetworkInfo info = cm.getActiveNetworkInfo();
-            return info != null && info.isConnected();
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            Network network = cm.getActiveNetwork();
+            NetworkCapabilities capabilities = network == null ? null : cm.getNetworkCapabilities(network);
+            return capabilities != null
+                    && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
         } catch (Exception e) {
             return false;
         }
